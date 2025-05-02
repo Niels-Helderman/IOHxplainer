@@ -9,7 +9,6 @@ import pandas as pd
 Utility functions
 """
 
-
 def runParallelFunction(runFunction, arguments):
     """Return the output of runFunction for each set of arguments .
 
@@ -71,6 +70,8 @@ class aoc_logger(ioh.logger.AbstractLogger):
         self.upper2 = upper2
         self.budget = budget
         self.transform = lambda x: np.log10(x) if scale_log else (lambda x: x)
+        self.auc1_list = []
+        self.auc2_list = []
 
     def __call__(self, log_info: ioh.LogInfo):
         """Subscalculate the aoc.
@@ -80,19 +81,40 @@ class aoc_logger(ioh.logger.AbstractLogger):
         """
         if log_info.evaluations >= self.budget:
             return
-        y_value = np.clip(log_info.raw_y_best, self.lower, self.upper1)
-        self.aoc1 += (self.transform(y_value) - self.transform(self.lower)) / (
-            self.transform(self.upper1) - self.transform(self.lower)
-        )
-        y_value = np.clip(log_info.raw_y_best, self.lower, self.upper2)
-        self.aoc2 += (self.transform(y_value) - self.transform(self.lower)) / (
+        y_value1 = np.clip(log_info.raw_y_best, self.lower, self.upper1)
+        fraction1 = (self.transform(y_value1) - self.transform(self.lower)) / (
+            self.transform(self.upper1) - self.transform(self.lower))
+        self.aoc1 += fraction1
+        
+        y_value2 = np.clip(log_info.raw_y_best, self.lower, self.upper2)
+        fraction2 = (self.transform(y_value2) - self.transform(self.lower)) / (
             self.transform(self.upper2) - self.transform(self.lower)
         )
+        self.aoc2 += fraction2
+            
+        # Save corrected intermediate AUC values every 1000 evaluations, for budget set to 10000
+        if log_info.evaluations % (self.budget/10) == 0:
+            # Correct AUC1
+            corrected_aoc1 = (
+                self.aoc1
+                + np.clip(self.budget - log_info.evaluations, 0, self.budget) * fraction1
+            ) / self.budget
+            self.auc1_list.append(1 - corrected_aoc1)
 
+            # Correct AUC2
+            corrected_aoc2 = (
+                self.aoc2
+                + np.clip(self.budget - log_info.evaluations, 0, self.budget) * fraction2
+            ) / self.budget
+            self.auc2_list.append(1 - corrected_aoc2)
+
+            
     def reset(self, func):
         super().reset()
         self.aoc1 = 0
         self.aoc2 = 0
+        self.auc1_list = []
+        self.auc2_list = []
 
 
 def correct_aoc(ioh_function, logger, budget):
@@ -165,23 +187,25 @@ def run_verification(args):
     myLoggerLarge = aoc_logger(
         budget, upper1=1e2, upper2=1e8, triggers=[ioh.logger.trigger.ALWAYS]
     )
-    func.attach_logger(myLoggerLarge)
+    # func.attach_logger(myLoggerLarge) # combine loggers first before attaching the ioh logger
     if full_ioh:
         logger = ioh.logger.Analyzer(
             root=folder_root,
             folder_name=f"{alg_name}-{dim}-{fid}-{iid}",
             algorithm_name=alg_name,
         )
-        func.attach_logger(logger)
+        # Combine the loggers using ioh.logger.combine
+        combined_logger = ioh.logger.Combine([myLoggerLarge, logger])
+    else:
+        combined_logger = myLoggerLarge
+    # Attach the combined logger
+    func.attach_logger(combined_logger)
+    
     return_list = []
     for seed in range(reps):
         np.random.seed(seed)
         optimizer(func, config, budget=budget, dim=dim, seed=seed)
         auc1, auc2 = correct_aoc(func, myLoggerLarge, budget)
-        func.reset()
-        myLoggerLarge.reset(func)
-        if full_ioh:
-            logger.reset()
         return_list.append(
             {
                 "fid": fid,
@@ -191,8 +215,14 @@ def run_verification(args):
                 **config,
                 "auc": auc1,
                 "aucLarge": auc2,
+                "auc_list": myLoggerLarge.auc1_list,
+                "aucLarge_list": myLoggerLarge.auc2_list,
             }
         )
+        func.reset()
+        myLoggerLarge.reset(func)
+        if full_ioh:
+            logger.reset()
     return return_list
 
 

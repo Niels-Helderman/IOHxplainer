@@ -281,15 +281,15 @@ bias_cmaes_explainer = explainer(
 
 de_cs = ConfigurationSpace(
     {
-        "F": [0.25, 0.5, 0.75, 1.25, 1.75],
-        "CR": [0.05, 0.25, 0.5, 0.75, 1.0],
-        "lambda_": ["nan", "2", "10"],
+        "F": (0.0, 1.0),
+        "CR": (0.001, 1.0),
+        "lambda_": (10, 50), # (10, 10 * dims)
         "mutation_base": ["target", "best", "rand"],
         "mutation_reference": ["pbest", "rand", "nan", "best"],
         "mutation_n_comps": [1, 2],
         "use_archive": [False, True],
         "crossover": ["exp", "bin"],
-        "adaptation_method": ["nan", "jDE", "shade"],
+        "adaptation_method": ["nan"],
         "lpsr": [False, True],
     }
 )
@@ -372,14 +372,14 @@ de_explainer = explainer(
     run_de,
     de_cs,
     algname="mod-de",
-    dims=[5, 30],  # ,10,40],#, 10, 20, 40  ,15,30
+    dims=[5],  # 30
     fids=np.arange(1, 25),  # ,5
     iids=[1, 2, 3, 4, 5],  # ,5
     reps=3,  # maybe later 10? = 11 days processing time
-    sampling_method="grid",  # or random
+    sampling_method="random",  # or random
     grid_steps_dict=steps_dict,
-    sample_size=None,  # only used with random method
+    sample_size=2,  # only used with random method
     budget=10000,  # 10000
-    seed=1,
+    seed=42,
     verbose=False,
 )

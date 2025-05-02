@@ -17,6 +17,9 @@ from ConfigSpace import ConfigurationSpace
 from ConfigSpace.util import generate_grid
 from sklearn.neighbors import KNeighborsRegressor
 
+from fanova import fANOVA
+from fanova.visualizer import Visualizer
+
 from .utils import (
     get_f0,
     get_query_string_from_dict,
@@ -231,6 +234,7 @@ class explainer(object):
             grid = generate_grid(self.config_space, self.grid_steps_dict)
         else:
             grid = self.config_space.sample_configuration(self.sample_size)
+
         if self.verbose:
             print(f"Evaluating {len(grid)} configurations.")
         return grid
@@ -251,6 +255,19 @@ class explainer(object):
             start_index (integer, optional) : Use to restart / continue a stopped run.
             checkpoint_file (string, optional): used for storing intermediate results.
         """
+        # Attempt to create the folder
+        try:
+            os.makedirs(folder_root, exist_ok=True)
+            print(f"Folder {folder_root} created successfully.")
+        except Exception as e:
+            print(f"Error creating folder {folder_root}: {e}")
+            return  # Exit the function if folder creation fails
+
+        # Verify folder existence
+        if not os.path.exists(folder_root):
+            print(f"Error: Folder {folder_root} was not created.")
+            return
+        
         # create the configuration grid
         if grid == None:
             grid = self._create_grid()
@@ -284,6 +301,8 @@ class explainer(object):
                                 *self.config_space.keys(),
                                 "auc",
                                 "aucLarge",
+                                "auc_list",
+                                "aucLarge_list",
                             ],
                         )
                         df_tab.to_csv(
@@ -1102,6 +1121,176 @@ class explainer(object):
                     else:
                         plt.show()
                     plt.clf()
+
+    def explain_fanova(
+        self,
+        partial_dependence=False,
+        best_config=True,
+        file_prefix=None,
+        check_bias=False,
+        keep_order=False,
+        catboost_params=None,
+    ):
+        """Plots the explanations for the evaluated algorithm and set of hyper-parameters using fANOVA.
+
+        Args:
+            partial_dependence (bool, optional): Show partial dependence plots. Defaults to False.
+            best_config (bool, optional): Show analysis of the best single optimizer. Defaults to True.
+            file_prefix (str, optional): Prefix for the file-name when saving figures. Defaults to None, meaning figures are not saved.
+            check_bias (bool, optional): Check the best configuration for structural bias. Defaults to False.
+            keep_order (bool, optional): Uses a fixed order for the features, handy if you want to plot multiple next to each other.
+            catboost_params (dict, optional): Parameters for CatBoost (not used in fANOVA). Defaults to None.
+        """
+        # use_matplotlib = True
+        # if file_prefix is None and hasattr(sys, "ps1"):
+        #     # Interactive mode
+        #     use_matplotlib = False
+
+        df = self.df.copy(True)
+        df = df.rename(
+            columns={"iid": "Instance variance", "seed": "Stochastic variance"}
+        )
+        df_display = df.copy(True)
+
+        # Prepare categorical columns
+        categorical_columns = df.dtypes[
+            (df.dtypes == "object") | (df.dtypes == "category")
+        ].index.to_list()
+        df[categorical_columns] = df[categorical_columns].apply(
+            lambda col: pd.Categorical(col).codes
+        )
+        df_display[categorical_columns] = df_display[categorical_columns].astype(
+            "category"
+        )
+
+        for dim in self.dims:
+            for fid in self.fids:
+                print(f"Processing d{dim} f{fid}..")
+                subdf_display = df_display[
+                    (df_display["fid"] == fid) & (df_display["dim"] == dim)
+                ]
+                subdf_display = subdf_display.reset_index()
+                subdf_display = subdf_display[
+                    [
+                        *self.config_space.keys(),
+                        "Instance variance",
+                        "Stochastic variance",
+                    ]
+                ]
+                subdf = df[(df["fid"] == fid) & (df["dim"] == dim)]
+                subdf = subdf.reset_index()
+                X = subdf[
+                    [
+                        *self.config_space.keys(),
+                        "Instance variance",
+                        "Stochastic variance",
+                    ]
+                ].to_numpy()
+
+                y = subdf["auc"].values
+
+                # Initialize fANOVA
+                fanova = fANOVA(X, y, config_space=self.config_space)
+
+                # Extract individual importance values
+                importance_data = []
+                print("Individual Hyperparameter Importance:")
+                for hp in self.config_space.keys():
+                    importance = fanova.quantify_importance((hp,))
+                    print(f"{hp}: {importance['individual importance']}")
+                    importance_data.append({"Feature": hp, "Importance": importance["individual importance"]})
+
+                # Convert to DataFrame for plotting
+                importance_df = pd.DataFrame(importance_data)
+                plt.figure(figsize=(10, 6))
+                importance_df = importance_df.sort_values('Importance', ascending=False)  # Sort by importance
+                # Create the horizontal bar plot with matplotlib
+                bars = plt.barh(importance_df['Feature'], importance_df['Importance'], color='darkblue')
+                # Add a color gradient to make it visually similar to the viridis palette
+                for i, bar in enumerate(bars):
+                    # Generate colors from the viridis colormap
+                    bar.set_color(plt.cm.viridis(i/len(importance_df)))
+                plt.title(f"Parameter Importance (fANOVA) for f{fid} in d{dim}")
+                plt.xlabel(f"Importance (%)")
+                plt.ylabel("Hyperparameter")
+                plt.tight_layout()
+                
+                # Save or show the plot
+                if file_prefix != None:
+                    plt.savefig(f"{file_prefix}summary_f{fid}_d{dim}.png")
+                else:
+                    plt.show()
+                plt.clf()
+                
+                # Print pairwise interaction importance
+                print("\nPairwise Interaction Importance:")
+                for hp1 in self.config_space.keys():
+                    for hp2 in self.config_space.keys():
+                        if hp1 != hp2:
+                            importance = fanova.quantify_importance((hp1, hp2))
+                            print(f"{hp1} and {hp2}: {importance['individual importance']}")
+
+                # Visualize results
+                vis = Visualizer(fanova, self.config_space, output_dir=file_prefix)
+                # Partial dependence plots
+                if partial_dependence:
+                    print("Generating partial dependence plots...")
+                    for hp in self.config_space.keys():
+                        vis.plot_marginal(hp, show=False)
+                        plt.tight_layout()
+                        plt.xlabel(
+                            f"Hyper-parameter contributions of $f_{{{hp}}}$ on $f_{{{fid}}}$ in $d={dim}$"
+                        )
+                        # Save or show the plot
+                        if file_prefix != None:
+                            plt.savefig(f"{file_prefix}pdp_{hp}_f{fid}_d{dim}.png")
+                        else:
+                            plt.show()
+                        plt.clf()
+                        
+                for hp1 in self.config_space.keys():
+                    for hp2 in self.config_space.keys():
+                        if hp1 != hp2:
+                            vis.plot_pairwise_marginal(hp1, hp2, show=False)
+                            plt.tight_layout()
+                            plt.xlabel(
+                                f"Hyper-parameter contributions on $f_{{{fid}}}$ in $d={dim}$"
+                            )
+                            # Save or show the plot
+                            if file_prefix != None:
+                                plt.savefig(f"{file_prefix}pairwise_{hp1}_{hp2}_f{fid}_d{dim}.png")
+                            else:
+                                plt.show()
+                            plt.clf()
+
+                # Analyze the best configuration
+                if best_config:
+                    print("Analyzing the best configuration...")
+                    best_config_name, _ = self.get_single_best(fid, dim)
+                    best_config, aucs = self._get_single_best(subdf)
+                    if self.verbose:
+                        print(
+                            "single best config ",
+                            best_config_name,
+                            "with mean auc ",
+                            aucs["auc"].mean(),
+                        )
+
+                    if check_bias:
+                        self.check_bias(
+                            best_config_name,
+                            dim=dim,
+                            file_prefix=file_prefix,
+                        )
+
+                    # Visualize the marginal importance of the best configuration
+                    for hp in best_config_name.keys():
+                        vis.plot_marginal(hp)
+                        plt.savefig(f"{file_prefix}singlebest_{hp}_f{fid}_d{dim}.png")
+                        plt.clf()
+
+                        
+                
 
 
 def compare(alg1, alg2, normalize=False):
