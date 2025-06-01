@@ -4,6 +4,8 @@ from multiprocessing import Pool, cpu_count
 import ioh
 import numpy as np
 import pandas as pd
+from ConfigSpace import ConfigurationSpace
+
 
 """
 Utility functions
@@ -267,3 +269,10 @@ def get_query_string_from_dict_for_others(filter, column):
         else f"({column} != {to_negate_val})"
     )
     return f"{normal_items} and {negated_item}"
+
+def remove_hyperparameter(config_space, hp_names_to_remove):
+    new_cs = ConfigurationSpace()
+    for hp in config_space.get_hyperparameters():
+        if hp.name not in hp_names_to_remove:
+            new_cs.add_hyperparameter(hp)
+    return new_cs

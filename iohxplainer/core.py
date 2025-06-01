@@ -2,23 +2,29 @@ import math
 import os
 import sys
 from functools import partial
-from itertools import product
+from itertools import product, combinations
 from multiprocessing import Pool, cpu_count
 
 import catboost as cb
 import ioh
 import matplotlib.pyplot as plt
 import numpy as np
+# Compatibility fix for numpy 1.24 and later, used in FANOVA
+if not hasattr(np, 'float'):
+    np.float = float
 import pandas as pd
 import scipy.stats as stats
 import shap
 import tqdm
 from ConfigSpace import ConfigurationSpace
 from ConfigSpace.util import generate_grid
+from ConfigSpace.hyperparameters import Hyperparameter, CategoricalHyperparameter, Constant, OrdinalHyperparameter, NumericalHyperparameter
 from sklearn.neighbors import KNeighborsRegressor
 
 from fanova import fANOVA
 from fanova.visualizer import Visualizer
+import copy
+
 
 from .utils import (
     get_f0,
@@ -28,6 +34,7 @@ from .utils import (
     run_verification,
     runParallelFunction,
     wrap_f0,
+    remove_hyperparameter,
 )
 
 
@@ -479,6 +486,7 @@ class explainer(object):
             self.biastest = BIAS()
         filename = None
         filename2 = None
+        preds = None
         if file_prefix != None:
             config_str = "_".join(f"{value}" for value in config.values())
             config_str = config_str.replace("1/2^lambda", "hp-lambda")
@@ -500,7 +508,8 @@ class explainer(object):
         ):
             if self.verbose:
                 print(f"Warning! Configuration shows structural bias of type {y}.")
-            self.biastest.explain(samples, preds, filename=filename)
+            if preds != None:
+                self.biastest.explain(samples, preds, filename=filename)
         if return_preds:
             if return_samples:
                 return y, preds, samples
@@ -654,8 +663,9 @@ class explainer(object):
 
         return pd.concat(behaviour, axis=1)
 
-    def _get_single_best(self, fid_df, use_median=False):
-        name_list = [*self.config_space.keys()]
+    def _get_single_best(self, fid_df, use_median=False, name_list=None):
+        if name_list is None:
+            name_list = [*self.config_space.keys()]
         if use_median:
             single_best = fid_df.groupby(name_list)["auc"].median().idxmax()
         else:  # use mean
@@ -669,11 +679,12 @@ class explainer(object):
             sing_best_conf[name_list[i]] = single_best[i]
         return sing_best_conf, df_single_best
 
-    def get_single_best(self, fid, dim, use_median=False):
-        subdf = self.df
+    def get_single_best(self, fid, dim, use_median=False, subdf=None, name_list=None):
+        if subdf is None:
+            subdf = self.df
         dim_df = subdf[subdf["dim"] == dim]
         fid_df = dim_df[dim_df["fid"] == fid]
-        return self._get_single_best(fid_df, use_median)
+        return self._get_single_best(fid_df, use_median, name_list=name_list)
 
     def get_single_best_for_iid(self, fid, iid, dim, use_median=False):
         subdf = self.df
@@ -954,6 +965,9 @@ class explainer(object):
             columns={"iid": "Instance variance", "seed": "Stochastic variance"}
         )
         df_display = df.copy(True)
+        
+        config_space = copy.deepcopy(self.config_space)
+        
         categorical_columns = df.dtypes[
             (df.dtypes == "object") | (df.dtypes == "category")
         ].index.to_list()
@@ -963,6 +977,30 @@ class explainer(object):
         df_display[categorical_columns] = df_display[categorical_columns].astype(
             "category"
         )
+        
+        # Convert categorical columns with only one category to Constant
+        for col in categorical_columns:
+            if df[col].nunique() == 1:
+                # Remove the old categorical hyperparameter and add it as a Constant instead
+                value = df[col].unique()[0]
+                config_space = remove_hyperparameter(config_space, [col])
+                config_space.add_hyperparameter(Constant(col, value))
+                print(f"Converted categorical '{col}' with one category to Constant({value})")
+                
+        # Identify constant hyperparameters
+        constant_hps = [
+            hp.name
+            for hp in config_space.get_hyperparameters()
+            if isinstance(hp, Constant)
+        ]
+        
+        # Remove constant hyperparameters from config_space
+        config_space = remove_hyperparameter(config_space, constant_hps)
+
+        # Drop constant columns from DataFrames
+        df = df.drop(columns=constant_hps)
+        df_display = df_display.drop(columns=constant_hps)
+        
         # for c in categorical_columns:
         # df[c] = df[c].astype('str')
         # df[c] = df[c].astype("category")
@@ -977,7 +1015,7 @@ class explainer(object):
                 subdf_display = subdf_display.reset_index()
                 subdf_display = subdf_display[
                     [
-                        *self.config_space.keys(),
+                        *config_space.keys(),
                         "Instance variance",
                         "Stochastic variance",
                     ]
@@ -986,7 +1024,7 @@ class explainer(object):
                 subdf = subdf.reset_index()
                 X = subdf[
                     [
-                        *self.config_space.keys(),
+                        *config_space.keys(),
                         "Instance variance",
                         "Stochastic variance",
                     ]
@@ -1042,7 +1080,7 @@ class explainer(object):
 
                 if partial_dependence:
                     # show dependency plots for all features
-                    for hyper_parameter in range(len(self.config_space.keys())):
+                    for hyper_parameter in range(len(config_space.keys())):
                         shap.dependence_plot(
                             hyper_parameter,
                             shap_values,
@@ -1062,8 +1100,8 @@ class explainer(object):
                 if best_config:
                     # show force plot of best configuration
                     # get best configuration from subdf
-                    best_config_name, _ = self.get_single_best(fid, dim)
-                    best_config, aucs = self._get_single_best(subdf)
+                    best_config_name, _ = self.get_single_best(fid, dim, subdf = subdf, name_list = [*config_space.keys()])
+                    best_config, aucs = self._get_single_best(subdf, name_list = [*config_space.keys()])
                     all_confs = X.query(get_query_string_from_dict(best_config))
                     best_config_index = all_confs.index[0]
                     all_indexes = all_confs.index.to_numpy()
@@ -1128,8 +1166,6 @@ class explainer(object):
         best_config=True,
         file_prefix=None,
         check_bias=False,
-        keep_order=False,
-        catboost_params=None,
     ):
         """Plots the explanations for the evaluated algorithm and set of hyper-parameters using fANOVA.
 
@@ -1138,8 +1174,6 @@ class explainer(object):
             best_config (bool, optional): Show analysis of the best single optimizer. Defaults to True.
             file_prefix (str, optional): Prefix for the file-name when saving figures. Defaults to None, meaning figures are not saved.
             check_bias (bool, optional): Check the best configuration for structural bias. Defaults to False.
-            keep_order (bool, optional): Uses a fixed order for the features, handy if you want to plot multiple next to each other.
-            catboost_params (dict, optional): Parameters for CatBoost (not used in fANOVA). Defaults to None.
         """
         # use_matplotlib = True
         # if file_prefix is None and hasattr(sys, "ps1"):
@@ -1151,152 +1185,272 @@ class explainer(object):
             columns={"iid": "Instance variance", "seed": "Stochastic variance"}
         )
         df_display = df.copy(True)
+        
+        config_space = copy.deepcopy(self.config_space)
 
         # Prepare categorical columns
-        categorical_columns = df.dtypes[
-            (df.dtypes == "object") | (df.dtypes == "category")
-        ].index.to_list()
-        df[categorical_columns] = df[categorical_columns].apply(
-            lambda col: pd.Categorical(col).codes
-        )
+        categorical_columns = [
+            hp.name
+            for hp in config_space.get_hyperparameters()
+            if isinstance(hp, CategoricalHyperparameter)
+        ]
+        for col in categorical_columns:
+            hp = config_space.get_hyperparameter(col)
+            # Map each category to its index in ConfigSpace
+            mapping = {cat: i for i, cat in enumerate(hp.choices)}
+            df[col] = df[col].map(mapping)
         df_display[categorical_columns] = df_display[categorical_columns].astype(
             "category"
         )
-
+        # Convert categorical columns with only one category to Constant
+        
+        for col in categorical_columns:
+            if df[col].nunique() == 1:
+                # Remove the old categorical hyperparameter and add it as a Constant instead
+                value = df[col].unique()[0]
+                config_space = remove_hyperparameter(config_space, [col])
+                config_space.add_hyperparameter(Constant(col, value))
+                print(f"Converted categorical '{col}' with one category to Constant({value})")
+                
+        # Identify constant hyperparameters
+        constant_hps = [
+            hp.name
+            for hp in config_space.get_hyperparameters()
+            if isinstance(hp, Constant)
+        ]
+        
+        # Remove constant hyperparameters from config_space
+        config_space = remove_hyperparameter(config_space, constant_hps)
+        
+        # Drop constant columns from DataFrames
+        df = df.drop(columns=constant_hps)
+        df_display = df_display.drop(columns=constant_hps)
+                
+        hyperparameters = config_space.get_hyperparameter_names()
+        print(f"Hyperparameters: {hyperparameters}")
         for dim in self.dims:
             for fid in self.fids:
                 print(f"Processing d{dim} f{fid}..")
-                subdf_display = df_display[
-                    (df_display["fid"] == fid) & (df_display["dim"] == dim)
-                ]
-                subdf_display = subdf_display.reset_index()
-                subdf_display = subdf_display[
-                    [
-                        *self.config_space.keys(),
-                        "Instance variance",
-                        "Stochastic variance",
-                    ]
-                ]
                 subdf = df[(df["fid"] == fid) & (df["dim"] == dim)]
                 subdf = subdf.reset_index()
-                X = subdf[
-                    [
-                        *self.config_space.keys(),
-                        "Instance variance",
-                        "Stochastic variance",
-                    ]
-                ].to_numpy()
+                X = subdf[hyperparameters] 
 
                 y = subdf["auc"].values
 
                 # Initialize fANOVA
-                fanova = fANOVA(X, y, config_space=self.config_space)
+                fanova = fANOVA(X, y, config_space=config_space)
+                
+                # create a subdirectory for each function ID if file_prefix is provided
+                if file_prefix is not None:
+                    fid_directory = f"{file_prefix}f{fid}"
+                    os.makedirs(fid_directory, exist_ok=True)
+                    print(f"Created directory: {fid_directory}")
 
                 # Extract individual importance values
                 importance_data = []
-                print("Individual Hyperparameter Importance:")
-                for hp in self.config_space.keys():
-                    importance = fanova.quantify_importance((hp,))
-                    print(f"{hp}: {importance['individual importance']}")
-                    importance_data.append({"Feature": hp, "Importance": importance["individual importance"]})
+                for hp in hyperparameters:
+                    importance_dict = fanova.quantify_importance((hp,))
+                    key = (hp,)
+                    if key in importance_dict:
+                        importance = importance_dict[key]
+                        importance["Feature"] = hp
+                        importance_data.append(importance)
+                    else:
+                        print(f"{hp}: Importance not computed (possibly constant or missing)")
 
-                # Convert to DataFrame for plotting
+                # Convert to DataFrame for plotting and saving
                 importance_df = pd.DataFrame(importance_data)
+                if file_prefix is not None:
+                    importance_df.to_latex(f"{fid_directory}/importance_f{fid}_d{dim}.tex", index=False)
+                    
                 plt.figure(figsize=(10, 6))
-                importance_df = importance_df.sort_values('Importance', ascending=False)  # Sort by importance
+                importance_df = importance_df.sort_values('individual importance', ascending=False)  # Sort by importance
                 # Create the horizontal bar plot with matplotlib
-                bars = plt.barh(importance_df['Feature'], importance_df['Importance'], color='darkblue')
+                bars = plt.barh(importance_df['Feature'], importance_df['individual importance'], color='darkblue')
                 # Add a color gradient to make it visually similar to the viridis palette
                 for i, bar in enumerate(bars):
                     # Generate colors from the viridis colormap
-                    bar.set_color(plt.cm.viridis(i/len(importance_df)))
+                    bar.set_color(plt.cm.get_cmap('viridis')(i/len(importance_df)))
                 plt.title(f"Parameter Importance (fANOVA) for f{fid} in d{dim}")
-                plt.xlabel(f"Importance (%)")
+                plt.xlabel("Importance (%)")
                 plt.ylabel("Hyperparameter")
                 plt.tight_layout()
                 
                 # Save or show the plot
                 if file_prefix != None:
-                    plt.savefig(f"{file_prefix}summary_f{fid}_d{dim}.png")
+                    plt.savefig(f"{fid_directory}/summary_f{fid}_d{dim}.png")
                 else:
                     plt.show()
                 plt.clf()
                 
-                # Print pairwise interaction importance
-                print("\nPairwise Interaction Importance:")
-                for hp1 in self.config_space.keys():
-                    for hp2 in self.config_space.keys():
-                        if hp1 != hp2:
-                            importance = fanova.quantify_importance((hp1, hp2))
-                            print(f"{hp1} and {hp2}: {importance['individual importance']}")
-
-                # Visualize results
-                vis = Visualizer(fanova, self.config_space, output_dir=file_prefix)
+                # Calculate the pairwise interaction importance
+                # pairwise_importance = []
+                # for hp1, hp2 in combinations(hyperparameters, 2):
+                #     if hp1 != hp2:
+                #         importance = fanova.quantify_importance((hp1, hp2))
+                #         key = (hp1, hp2)
+                #         if key in importance_dict:
+                #             importance = importance_dict[key]
+                #             importance["Features"] = hp1, hp2
+                #             pairwise_importance.append(importance)
+                #         else:
+                #             print(f"{hp1, hp2}: Importance not computed (possibly constant or missing)")
+                
+                # # Convert to DataFrame for saving
+                # pairwise_importance = pd.DataFrame(pairwise_importance)
+                # if file_prefix is not None:
+                #     pairwise_importance.to_latex(f"{fid_directory}/pairwise_importance_f{fid}_d{dim}.tex", index=False)
+                    
+                # Visualizer for the results
+                vis = Visualizer(fanova, config_space, directory=fid_directory)
                 # Partial dependence plots
                 if partial_dependence:
-                    print("Generating partial dependence plots...")
-                    for hp in self.config_space.keys():
+                    for hp in hyperparameters:
                         vis.plot_marginal(hp, show=False)
                         plt.tight_layout()
-                        plt.xlabel(
-                            f"Hyper-parameter contributions of $f_{{{hp}}}$ on $f_{{{fid}}}$ in $d={dim}$"
+                        plt.title(
+                            f"Hyper-parameter contributions of {hp} on f{fid} in d{dim}"
                         )
                         # Save or show the plot
                         if file_prefix != None:
-                            plt.savefig(f"{file_prefix}pdp_{hp}_f{fid}_d{dim}.png")
+                            plt.savefig(f"{fid_directory}/pdp_{hp}_f{fid}_d{dim}.png")
                         else:
                             plt.show()
                         plt.clf()
                         
-                for hp1 in self.config_space.keys():
-                    for hp2 in self.config_space.keys():
-                        if hp1 != hp2:
-                            vis.plot_pairwise_marginal(hp1, hp2, show=False)
-                            plt.tight_layout()
-                            plt.xlabel(
-                                f"Hyper-parameter contributions on $f_{{{fid}}}$ in $d={dim}$"
-                            )
-                            # Save or show the plot
-                            if file_prefix != None:
-                                plt.savefig(f"{file_prefix}pairwise_{hp1}_{hp2}_f{fid}_d{dim}.png")
-                            else:
-                                plt.show()
-                            plt.clf()
+                for hp1, hp2 in combinations(hyperparameters, 2):
+                    # Custom version of the generate_pairwise_marginal function
+                    # Generate pairwise marginal data
+                    plot_pairwise_marginal_custom(vis, param_list=[hp1, hp2], show=False, fid=fid, dim=dim)
 
-                # Analyze the best configuration
-                if best_config:
-                    print("Analyzing the best configuration...")
-                    best_config_name, _ = self.get_single_best(fid, dim)
-                    best_config, aucs = self._get_single_best(subdf)
-                    if self.verbose:
-                        print(
-                            "single best config ",
-                            best_config_name,
-                            "with mean auc ",
-                            aucs["auc"].mean(),
-                        )
+                    # Save or show the plot
+                    if file_prefix is not None:
+                        plt.savefig(f"{fid_directory}/pairwise_{hp1}_{hp2}_f{fid}_d{dim}.png")
+                    else:
+                        plt.show()
+                    plt.clf()
+                    plt.close()
 
-                    if check_bias:
-                        self.check_bias(
-                            best_config_name,
-                            dim=dim,
-                            file_prefix=file_prefix,
-                        )
-
-                    # Visualize the marginal importance of the best configuration
-                    for hp in best_config_name.keys():
-                        vis.plot_marginal(hp)
-                        plt.savefig(f"{file_prefix}singlebest_{hp}_f{fid}_d{dim}.png")
-                        plt.clf()
 
                         
-                
+
+def plot_pairwise_marginal_custom(
+        FanovaVisualizer: Visualizer, 
+        param_list, 
+        resolution=20, 
+        show=False, 
+        three_d=True, 
+        colormap=plt.get_cmap("viridis"), 
+        add_colorbar=True,
+        fid=None,
+        dim=None,
+    ):
+    """
+    Custom version to create a plot of pairwise marginal of a selected parameters
+
+    Parameters
+    ----------
+    FanovaVisualizer: Fanova.Visualizer
+        Already fitted to the data
+    param_list: list of ints or strings
+        Contains the selected parameters
+    resolution: int
+        Number of samples to generate from the parameter range as
+        values to predict
+    show: boolean
+        whether to call plt.show() to show plot directly as interactive matplotlib-plot
+    three_d: boolean
+        whether or not to plot pairwise marginals in 3D-plot
+    colormap: matplotlib.Colormap
+        which colormap to use for the 3D plots
+    add_colorbar: bool
+        whether to add the colorbar for 3d plots
+    fid: int
+        The function id of the function to be plotted
+    dim: int
+        The dimension of the function to be plotted
+    """
+    if len(set(param_list)) != 2:
+        raise ValueError("You have to specify 2 (different) parameters")
+
+    params, param_names, param_indices = FanovaVisualizer._get_parameter(param_list)
+
+    first_is_numerical = isinstance(params[0], NumericalHyperparameter)
+    second_is_numerical = isinstance(params[1], NumericalHyperparameter)
+
+    plt.close()
+    plt.title('%s and %s' % (param_names[0], param_names[1]))
+
+    if first_is_numerical and second_is_numerical:
+        # No categoricals -> create heatmap / 2D-plot
+        grid_list, zz = FanovaVisualizer.generate_pairwise_marginal(param_indices, resolution)
+
+        z_min, z_max = zz.min(), zz.max()
+        display_xx, display_yy = np.meshgrid(grid_list[0], grid_list[1])
+
+        # Create a top-down heatmap
+        plt.figure(figsize=(8, 6))
+        contourf = plt.contourf(display_xx, display_yy, zz.T, levels=50, cmap=colormap, vmin=z_min, vmax=z_max)
+        # Add contour lines
+        contour = plt.contour(display_xx, display_yy, zz.T, levels=50, vmin=z_min, vmax=z_max)
+        # Add labels to the contour lines (optional)
+        plt.clabel(contour, fontsize=8, inline=True)
+
+        if FanovaVisualizer.cs_params[param_indices[0]].log:
+            plt.xscale('log')
+        if FanovaVisualizer.cs_params[param_indices[1]].log:
+            plt.yscale('log')
+            
+        plt.xlabel(param_names[0])
+        plt.ylabel(param_names[1])
+        plt.title(f"Pairwise Interaction: {param_names[0]} vs {param_names[1]} on $f_{{{fid}}}$ in $d={dim}$")
+
+        if add_colorbar:
+            plt.colorbar(contourf, label="Importance")
+
+    else:
+        # At least one of the two parameters is non-numerical (categorical, ordinal or constant)
+        if first_is_numerical or second_is_numerical:
+            # Only one of them is non-numerical -> create multi-line-plot
+            # Make sure categorical is first in indices (for iteration below)
+            numerical_idx = 0 if first_is_numerical else 1
+            categorical_idx = 1 - numerical_idx
+            grid_labels, zz = FanovaVisualizer.generate_pairwise_marginal(param_indices, resolution)
+
+            if first_is_numerical:
+                zz = zz.T
+
+            for i, cat in enumerate(grid_labels[categorical_idx]):
+                if params[numerical_idx].log:
+                    plt.semilogx(grid_labels[numerical_idx], zz[i], label='%s' % str(cat))
+                else:
+                    plt.plot(grid_labels[numerical_idx], zz[i], label='%s' % str(cat))
+
+            plt.ylabel(FanovaVisualizer._y_label)
+            plt.xlabel(param_names[numerical_idx])  # x-axis displays numerical
+            plt.legend()
+            plt.tight_layout()
+
+        else:
+            # Both parameters are categorical -> create hotmap
+            choices, zz = FanovaVisualizer.generate_pairwise_marginal(param_indices, resolution)
+            plt.imshow(zz.T, cmap='hot', interpolation='nearest')
+            plt.xticks(np.arange(0, len(choices[0])), choices[0], fontsize=8)
+            plt.yticks(np.arange(0, len(choices[1])), choices[1], fontsize=8)
+            plt.xlabel(param_names[0])
+            plt.ylabel(param_names[1])
+            plt.colorbar().set_label(FanovaVisualizer._y_label)
+
+    if show:
+        plt.show()
+
+    return plt                
 
 
 def compare(alg1, alg2, normalize=False):
     # assuming both alg1 and alg2 are explainer objects
     if not isinstance(alg1, explainer):
-        raise "instance alg1 should be an explainer object"
+        raise TypeError("instance alg1 should be an explainer object")
     df1 = alg1.df
     df2 = alg2.df
 
