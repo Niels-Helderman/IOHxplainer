@@ -105,11 +105,11 @@ def create_shap_over_time(fid, normalize = True, include_legend = True):
         dt_plotting = dt_plotting.query(f"Fid == {fid}")
     if include_legend:
         plt.figure(figsize=(19,9))
-        sbs.lineplot(data=dt_plotting.sort_values(['Budget', 'value'], ascending=[False, False]), x='Budget', y='value', hue='variable', style='variable', lw=4, dashes=[(1,0),(1,1),(2,2),(3,1)], markers=True, ms=15)
+        sbs.lineplot(data=dt_plotting.sort_values(['Budget', 'value'], ascending=[False, False]), x='Budget', y='value', hue='variable', style='variable', lw=4, dashes=[(1,0),(1,1),(2,2),(3,1)], markers=True, ms=15, style_order=feature_names_plot, hue_order=feature_names_plot)
         plt.legend(fontsize=16, title='Parameter', loc='lower right', bbox_to_anchor=(1.25, 0))
     else:
         plt.figure(figsize=(16,9))
-        sbs.lineplot(data=dt_plotting.sort_values(['Budget', 'variable'], ascending=[False, False]), x='Budget', y='value', hue='variable', style='variable', lw=4, dashes=[(1,0),(1,1),(2,2),(3,1)], markers=True, ms=15, legend=None)
+        sbs.lineplot(data=dt_plotting.sort_values(['Budget', 'variable'], ascending=[False, False]), x='Budget', y='value', hue='variable', style='variable', lw=4, dashes=[(1,0),(1,1),(2,2),(3,1)], markers=True, ms=15, style_order=feature_names_plot, hue_order=feature_names_plot, legend=None)
 
     # plt.xlim(100, 10^5)
     plt.xscale('log')
