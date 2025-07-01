@@ -7,18 +7,20 @@ import matplotlib.pyplot as plt
 import os
 from ConfigSpace import ConfigurationSpace
 
-font = {'size'   : 24}
+font = {'size'   : 30}
 
 plt.rc('font', **font)
 import matplotlib
 matplotlib.rcParams['pdf.fonttype'] = 42
 matplotlib.rcParams['ps.fonttype'] = 42
 
+dim = 5
+
 de_cs = ConfigurationSpace(
     {
         "F": (0.0, 1.0),
         "CR": (0.001, 1.0),
-        "lambda_": (10, 50), # (10, 10 * dims)
+        "lambda_": (10, 10 * dim), # (10, 10 * dims)
         "mutation_base": ["target", "best", "rand"],
         "mutation_reference": ["pbest", "rand", "nan", "best"],
         "mutation_n_comps": [1, 2],
@@ -43,7 +45,9 @@ feature_names_plot = [
     'Mutation N Comps',
     'Use Archive',
     'Crossover',
-    'LPSR'
+    'LPSR',
+    "Instance variance",
+    "Stochastic variance",
     ]
 
 BASE_DIR = ""
@@ -61,12 +65,10 @@ def load_data():
         stds = []
         for budget in tqdm(budgets):
             for fid in fids:
-                if fid == 12 and budget == 100:
-                    print(fid, budget)
-                else:
-                    dt2 = pd.read_csv(f"{BASE_DIR}/F{fid}_B{budget}.csv", index_col=0)
-                    stds.append([fid, budget, dt2['auc'].std()])
+                dt2 = pd.read_csv(f"{BASE_DIR}/F{fid}_B{budget}.csv", index_col=0)
+                stds.append([fid, budget, dt2['auc'].std()])
         dt_stds = pd.DataFrame.from_records(stds, columns = ['Fid', 'Budget', 'std'])
+        dt_stds['std'] = dt_stds['std'].replace(0, 1)
         dt_stds.to_csv(f"{BASE_DIR}Thesis_dt_stds.csv")
 
     if os.path.exists(f"{BASE_DIR}Thesis_dt_molt.csv"):
@@ -80,7 +82,9 @@ def load_data():
                     shaps = np.loadtxt(f"{BASE_DIR}/shaps/F{fid}_B{budget}.txt")
                     records.append([fid,budget,*np.mean(np.abs(shaps),axis=0).tolist()])
                 except:
-                    print(fid, budget)
+                    # If SHAP file is missing, fill with zeros for all features
+                    records.append([fid, budget, *([0] * len(features))])
+                    print(f"Missing SHAP file for F{fid} B{budget}, filling with zeros.")
         dt_plot = pd.DataFrame.from_records(records, columns=["Fid", "Budget", *features])
         dt_molt = dt_plot.melt(id_vars=['Fid', 'Budget'])
         dt_molt.to_csv(f"{BASE_DIR}Thesis_dt_molt.csv")
@@ -106,7 +110,7 @@ def create_shap_over_time(fid, normalize = True, include_legend = True):
     if include_legend:
         plt.figure(figsize=(19,9))
         sbs.lineplot(data=dt_plotting.sort_values(['Budget', 'value'], ascending=[False, False]), x='Budget', y='value', hue='variable', style='variable', lw=4, dashes=[(1,0),(1,1),(2,2),(3,1)], markers=True, ms=15, style_order=feature_names_plot, hue_order=feature_names_plot)
-        plt.legend(fontsize=16, title='Parameter', loc='lower right', bbox_to_anchor=(1.25, 0))
+        plt.legend(fontsize=20, title='Parameter', loc='lower right', bbox_to_anchor=(1.45, 0))
     else:
         plt.figure(figsize=(16,9))
         sbs.lineplot(data=dt_plotting.sort_values(['Budget', 'variable'], ascending=[False, False]), x='Budget', y='value', hue='variable', style='variable', lw=4, dashes=[(1,0),(1,1),(2,2),(3,1)], markers=True, ms=15, style_order=feature_names_plot, hue_order=feature_names_plot, legend=None)

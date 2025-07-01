@@ -8,6 +8,8 @@ from multiprocessing import Pool, cpu_count
 import catboost as cb
 import ioh
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 import numpy as np
 # Compatibility fix for numpy 1.24 and later, used in FANOVA
 if not hasattr(np, 'float'):
@@ -971,6 +973,12 @@ class explainer(object):
         categorical_columns = df.dtypes[
             (df.dtypes == "object") | (df.dtypes == "category")
         ].index.to_list()
+        # # To know the mapping of the categorical columns, to be able to interpret the SHAP plots.
+        # for col in categorical_columns:
+        #     cat = pd.Categorical(df[col])
+        #     mapping = {cat: i for i, cat in enumerate(cat.categories)}
+        #     print(f"Mapping for '{col}': {mapping}")
+            
         df[categorical_columns] = df[categorical_columns].apply(
             lambda col: pd.Categorical(col).codes
         )
@@ -1175,10 +1183,6 @@ class explainer(object):
             file_prefix (str, optional): Prefix for the file-name when saving figures. Defaults to None, meaning figures are not saved.
             check_bias (bool, optional): Check the best configuration for structural bias. Defaults to False.
         """
-        # use_matplotlib = True
-        # if file_prefix is None and hasattr(sys, "ps1"):
-        #     # Interactive mode
-        #     use_matplotlib = False
 
         df = self.df.copy(True)
         df = df.rename(
@@ -1198,6 +1202,7 @@ class explainer(object):
             hp = config_space.get_hyperparameter(col)
             # Map each category to its index in ConfigSpace
             mapping = {cat: i for i, cat in enumerate(hp.choices)}
+            # print(f"Mapping for categorical '{col}': {mapping}")
             df[col] = df[col].map(mapping)
         df_display[categorical_columns] = df_display[categorical_columns].astype(
             "category"
@@ -1232,7 +1237,7 @@ class explainer(object):
             for fid in self.fids:
                 print(f"Processing d{dim} f{fid}..")
                 subdf = df[(df["fid"] == fid) & (df["dim"] == dim)]
-                subdf = subdf.reset_index()
+                subdf = subdf.reset_index()               
                 X = subdf[hyperparameters] 
 
                 y = subdf["auc"].values
@@ -1260,20 +1265,27 @@ class explainer(object):
 
                 # Convert to DataFrame for plotting and saving
                 importance_df = pd.DataFrame(importance_data)
+                importance_df = importance_df.sort_values('Feature')                
                 if file_prefix is not None:
                     importance_df.to_latex(f"{fid_directory}/importance_f{fid}_d{dim}.tex", index=False)
+                
+                # # If you want to load the importance DataFrame from a LaTeX table, uncomment the following line:    
+                # importance_df = load_df_from_latex_table(f"{fid_directory}/importance_f{fid}_d{dim}.tex")
                     
-                plt.figure(figsize=(10, 6))
-                importance_df = importance_df.sort_values('individual importance', ascending=False)  # Sort by importance
+                plt.figure(figsize=(8, 6))
                 # Create the horizontal bar plot with matplotlib
                 bars = plt.barh(importance_df['Feature'], importance_df['individual importance'], color='darkblue')
                 # Add a color gradient to make it visually similar to the viridis palette
                 for i, bar in enumerate(bars):
                     # Generate colors from the viridis colormap
                     bar.set_color(plt.cm.get_cmap('viridis')(i/len(importance_df)))
-                plt.title(f"Parameter Importance (fANOVA) for f{fid} in d{dim}")
-                plt.xlabel("Importance (%)")
-                plt.ylabel("Hyperparameter")
+                plt.title(f"f{fid} in d{dim}", fontsize=18)
+                plt.xlabel("Importance (%)", fontsize=16)
+                plt.ylabel("Hyperparameter", fontsize=16)
+                plt.tick_params(axis='y', pad=10)
+                plt.xticks(fontsize=16)
+                plt.yticks(fontsize=16)
+                plt.xlim(0, 0.5)
                 plt.tight_layout()
                 
                 # Save or show the plot
@@ -1282,12 +1294,14 @@ class explainer(object):
                 else:
                     plt.show()
                 plt.clf()
+                plt.close()
                 
-                # Calculate the pairwise interaction importance
+                # # Calculate the pairwise interaction importance
+                # # Takes a really long time, more than a day for 1 function and 10 hyperparameters
                 # pairwise_importance = []
                 # for hp1, hp2 in combinations(hyperparameters, 2):
                 #     if hp1 != hp2:
-                #         importance = fanova.quantify_importance((hp1, hp2))
+                #         importance_dict = fanova.quantify_importance((hp1, hp2))
                 #         key = (hp1, hp2)
                 #         if key in importance_dict:
                 #             importance = importance_dict[key]
@@ -1321,7 +1335,7 @@ class explainer(object):
                 for hp1, hp2 in combinations(hyperparameters, 2):
                     # Custom version of the generate_pairwise_marginal function
                     # Generate pairwise marginal data
-                    plot_pairwise_marginal_custom(vis, param_list=[hp1, hp2], show=False, fid=fid, dim=dim)
+                    plot_pairwise_marginal_custom(vis, param_list=[hp1, hp2], show=False, fid=fid, dim=dim, fixed_cmap=False)
 
                     # Save or show the plot
                     if file_prefix is not None:
@@ -1330,7 +1344,35 @@ class explainer(object):
                         plt.show()
                     plt.clf()
                     plt.close()
+                    
+                
 
+
+
+
+def load_df_from_latex_table(file_path):
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+
+    # Filter lines that contain table data (skip LaTeX commands)
+    data_lines = [line.strip() for line in lines if '&' in line and not line.startswith('\\')]
+
+    # Remove trailing LaTeX line endings (\\) and split by '&'
+    parsed_rows = [line.replace('\\\\', '').split('&') for line in data_lines]
+    parsed_rows = [[item.strip() for item in row] for row in parsed_rows]
+
+    # First row is header
+    header = parsed_rows[0]
+    rows = parsed_rows[1:]
+
+    # Create DataFrame
+    df = pd.DataFrame(rows, columns=header)
+
+    # Convert numeric columns
+    for col in header[:-1]:  # all except 'Feature'
+        df[col] = pd.to_numeric(df[col])
+
+    return df
 
                         
 
@@ -1339,8 +1381,9 @@ def plot_pairwise_marginal_custom(
         param_list, 
         resolution=20, 
         show=False, 
-        three_d=True, 
-        colormap=plt.get_cmap("viridis"), 
+        fixed_cmap=False, 
+        colormap=plt.get_cmap("turbo"), # for better visulisation for a larger range of values
+        # colormap=plt.get_cmap("viridis"), 
         add_colorbar=True,
         fid=None,
         dim=None,
@@ -1385,28 +1428,43 @@ def plot_pairwise_marginal_custom(
         # No categoricals -> create heatmap / 2D-plot
         grid_list, zz = FanovaVisualizer.generate_pairwise_marginal(param_indices, resolution)
 
-        z_min, z_max = zz.min(), zz.max()
+        vmin, vmax = zz.min(), zz.max()
+
         display_xx, display_yy = np.meshgrid(grid_list[0], grid_list[1])
 
         # Create a top-down heatmap
-        plt.figure(figsize=(8, 6))
-        contourf = plt.contourf(display_xx, display_yy, zz.T, levels=50, cmap=colormap, vmin=z_min, vmax=z_max)
+        fig = plt.figure(figsize=(8, 6))
+        ax = plt.gca()
+        if fixed_cmap:
+            if dim == 5:
+                vmin=0
+                vmax=0.6
+            elif dim == 30:
+                vmin=0
+                vmax=0.3
+            
+        contourf = plt.contourf(display_xx, display_yy, zz.T, levels=75, cmap=colormap, vmin=vmin, vmax=vmax)
+        plt.xticks(fontsize=16)
+        plt.yticks(fontsize=16)
         # Add contour lines
-        contour = plt.contour(display_xx, display_yy, zz.T, levels=50, vmin=z_min, vmax=z_max)
+        # contour = plt.contour(display_xx, display_yy, zz.T, levels=50, vmin=z_min, vmax=z_max)
         # Add labels to the contour lines (optional)
-        plt.clabel(contour, fontsize=8, inline=True)
+        # plt.clabel(contour, fontsize=8, inline=True)
 
         if FanovaVisualizer.cs_params[param_indices[0]].log:
             plt.xscale('log')
         if FanovaVisualizer.cs_params[param_indices[1]].log:
             plt.yscale('log')
             
-        plt.xlabel(param_names[0])
-        plt.ylabel(param_names[1])
-        plt.title(f"Pairwise Interaction: {param_names[0]} vs {param_names[1]} on $f_{{{fid}}}$ in $d={dim}$")
+        plt.xlabel(param_names[0], fontsize=16)
+        plt.ylabel(param_names[1], fontsize=16)
+        plt.title(f"$f_{{{fid}}}$ in $d={dim}$", fontsize=18)
 
         if add_colorbar:
-            plt.colorbar(contourf, label="Importance")
+            norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+            mappable = cm.ScalarMappable(norm=norm, cmap=colormap)
+            cbar = fig.colorbar(mappable, ax=ax, ticks=np.linspace(vmin, vmax, 7))
+            cbar.set_label("Importance", fontsize=16)
 
     else:
         # At least one of the two parameters is non-numerical (categorical, ordinal or constant)
